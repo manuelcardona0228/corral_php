@@ -4,6 +4,10 @@
 php.json lists every build: {"builds": {"8.4.27": {"macos-aarch64":
 {"url": ..., "sha256": ...}}}}. Corral accepts it only with a valid
 php.json.sig, made with CORRAL_PHP_FEED_KEY.
+
+scripts/security.json holds the oldest patch of each line without known flaws.
+Raising a line there and pushing marks older versions as vulnerable in every
+Corral, without a new release of the app.
 """
 import base64
 import glob
@@ -26,6 +30,11 @@ RUNNERS = {
     "linux-x86_64": "ubuntu-24.04",
     "linux-aarch64": "ubuntu-24.04-arm",
 }
+
+
+def security():
+    with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "security.json")) as f:
+        return json.load(f)
 
 
 def fetch(url):
@@ -53,7 +62,8 @@ def plan():
         if not re.fullmatch(r"\d+\.\d+\.\d+", v):
             sys.exit(f"not an exact version: {v}")
     wanted = wanted or [newest(line) for line in LINES]
-    builds = current_feed()["builds"]
+    feed = current_feed()
+    builds = feed["builds"]
     jobs = [
         {"version": v, "platform": platform, "runner": runner}
         for v in wanted
@@ -62,6 +72,7 @@ def plan():
     ]
     print(f"matrix={json.dumps(jobs)}")
     print(f"any={'true' if jobs else 'false'}")
+    print(f"resign={'true' if feed.get('secure') != security() else 'false'}")
 
 
 def gh(*args, check=True):
@@ -85,8 +96,6 @@ def sign(raw):
 def publish(folder):
     feed = current_feed()
     files = sorted(glob.glob(os.path.join(folder, "php-*.tar.gz")))
-    if not files:
-        sys.exit("no builds to publish")
     for path in files:
         name = os.path.basename(path)
         match = re.fullmatch(r"php-(\d+\.\d+\.\d+)-(.+)\.tar\.gz", name)
@@ -102,6 +111,7 @@ def publish(folder):
             "url": f"https://github.com/{REPO}/releases/download/{tag}/{name}",
             "sha256": digest,
         }
+    feed["secure"] = security()
     raw = json.dumps(feed, indent=2, sort_keys=True).encode()
     with open("php.json", "wb") as f:
         f.write(raw)
