@@ -70,7 +70,7 @@ jobs:
           for ext in intl pdo_pgsql sodium redis; do "$php" -m | grep -qx "$ext"; done
           buildroot/bin/php-fpm -v | grep -F "PHP $PHP_VERSION "
           # A closed port must fail at once. Swoole's driver hangs here.
-          timeout 20 "$php" -r 'try { new PDO("pgsql:host=127.0.0.1;port=1;dbname=x"); } catch (PDOException $e) { exit(0); } exit(1);'
+          perl -e 'alarm 20; exec @ARGV' "$php" -r 'try { new PDO("pgsql:host=127.0.0.1;port=1;dbname=x"); } catch (PDOException $e) { exit(0); } exit(1);'
       - name: Sign for macOS
         if: runner.os == 'macOS'
         run: codesign --force --sign - buildroot/bin/php buildroot/bin/php-fpm

@@ -21,7 +21,7 @@ FEED_TAG = "php-feed"
 FEED_URL = f"https://github.com/{REPO}/releases/download/{FEED_TAG}/php.json"
 LINES = ["8.5", "8.4", "8.3", "8.2"]
 RUNNERS = {
-    "macos-aarch64": "macos-14",
+    "macos-aarch64": "macos-15",
     "macos-x86_64": "macos-15-intel",
     "linux-x86_64": "ubuntu-24.04",
     "linux-aarch64": "ubuntu-24.04-arm",
