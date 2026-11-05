@@ -1,0 +1,100 @@
+# Keeps Corral's PHP feed current: every day it looks for PHP releases that
+# aren't built yet, compiles them for each platform with static-php-cli and
+# publishes them, signed. Corral installs from that feed.
+name: PHP builds
+
+on:
+  schedule:
+    - cron: "17 */6 * * *"
+  workflow_dispatch:
+    inputs:
+      versions:
+        description: "Exact versions, comma-separated (empty: newest of each line)"
+        required: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: php-builds
+  cancel-in-progress: false
+
+env:
+  SPC_VERSION: "2.8.5"
+  # Native pdo_pgsql, never Swoole's: its driver hangs outside a coroutine.
+  EXTENSIONS: "bcmath,bz2,calendar,ctype,curl,dom,exif,fileinfo,filter,ftp,gd,gmp,iconv,intl,mbstring,mysqlnd,opcache,openssl,pcntl,pdo,pdo_mysql,pdo_pgsql,pdo_sqlite,pgsql,phar,posix,redis,session,simplexml,soap,sockets,sodium,sqlite3,tokenizer,xml,xmlreader,xmlwriter,zip,zlib"
+
+jobs:
+  plan:
+    runs-on: ubuntu-24.04
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+      any: ${{ steps.plan.outputs.any }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: plan
+        env:
+          VERSIONS: ${{ inputs.versions }}
+        run: python3 scripts/php_feed.py plan >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: plan
+    if: needs.plan.outputs.any == 'true'
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    env:
+      PHP_VERSION: ${{ matrix.version }}
+      PLATFORM: ${{ matrix.platform }}
+    steps:
+      - name: Get static-php-cli
+        run: |
+          curl -fsSL -o spc.tgz "https://github.com/crazywhalecc/static-php-cli/releases/download/$SPC_VERSION/spc-$PLATFORM.tar.gz"
+          tar xzf spc.tgz
+          chmod +x spc
+      - name: Prepare the toolchain
+        run: ./spc doctor --auto-fix
+      - name: Download sources
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: ./spc download --with-php="$PHP_VERSION" --for-extensions="$EXTENSIONS" --prefer-pre-built --retry=3
+      - name: Build
+        run: ./spc build "$EXTENSIONS" --build-cli --build-fpm
+      - name: Check the build
+        run: |
+          php=buildroot/bin/php
+          "$php" -v | grep -F "PHP $PHP_VERSION "
+          for ext in intl pdo_pgsql sodium redis; do "$php" -m | grep -qx "$ext"; done
+          buildroot/bin/php-fpm -v | grep -F "PHP $PHP_VERSION "
+          # A closed port must fail at once. Swoole's driver hangs here.
+          timeout 20 "$php" -r 'try { new PDO("pgsql:host=127.0.0.1;port=1;dbname=x"); } catch (PDOException $e) { exit(0); } exit(1);'
+      - name: Sign for macOS
+        if: runner.os == 'macOS'
+        run: codesign --force --sign - buildroot/bin/php buildroot/bin/php-fpm
+      - name: Package
+        run: tar czf "php-$PHP_VERSION-$PLATFORM.tar.gz" -C buildroot/bin php php-fpm
+      - uses: actions/upload-artifact@v4
+        with:
+          name: php-${{ matrix.version }}-${{ matrix.platform }}
+          path: php-${{ matrix.version }}-${{ matrix.platform }}.tar.gz
+          if-no-files-found: error
+
+  publish:
+    needs: [plan, build]
+    # A platform that failed shouldn't hold back the others.
+    if: always() && needs.plan.outputs.any == 'true'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: builds
+          merge-multiple: true
+      - run: pip install --break-system-packages cryptography
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          CORRAL_PHP_FEED_KEY: ${{ secrets.CORRAL_PHP_FEED_KEY }}
+        run: python3 scripts/php_feed.py publish builds
