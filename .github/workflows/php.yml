@@ -23,6 +23,11 @@ concurrency:
 env:
   SPC_VERSION: "2.8.5"
   # Native pdo_pgsql, never Swoole's: its driver hangs outside a coroutine.
+  # GD's formats are optional libraries: without them it has no JPEG.
+  LIBRARIES: "libjpeg,freetype,libwebp"
+  # Offered as .so files Corral installs on demand. macOS only: a static Linux
+  # PHP can't load any.
+  SHARED: "xdebug,imagick,mongodb,apcu,pcov,igbinary,yaml,ssh2"
   EXTENSIONS: "bcmath,bz2,calendar,ctype,curl,dom,exif,fileinfo,filter,ftp,gd,gmp,iconv,intl,mbstring,mysqlnd,opcache,openssl,pcntl,pdo,pdo_mysql,pdo_pgsql,pdo_sqlite,pgsql,phar,posix,redis,session,simplexml,soap,sockets,sodium,sqlite3,tokenizer,xml,xmlreader,xmlwriter,zip,zlib"
 
 jobs:
@@ -56,6 +61,7 @@ jobs:
     env:
       PHP_VERSION: ${{ matrix.version }}
       PLATFORM: ${{ matrix.platform }}
+      REVISION: ${{ matrix.revision }}
     steps:
       - name: Get static-php-cli
         run: |
@@ -67,14 +73,25 @@ jobs:
       - name: Download sources
         env:
           GITHUB_TOKEN: ${{ github.token }}
-        run: ./spc download --with-php="$PHP_VERSION" --for-extensions="$EXTENSIONS" --prefer-pre-built --retry=3
+        run: |
+          all="$EXTENSIONS"
+          if [ "$RUNNER_OS" = macOS ]; then all="$EXTENSIONS,$SHARED"; fi
+          ./spc download --with-php="$PHP_VERSION" --for-extensions="$all" --for-libs="$LIBRARIES" --prefer-pre-built --retry=3
       - name: Build
-        run: ./spc build "$EXTENSIONS" --build-cli --build-fpm
+        run: |
+          base=(./spc build "$EXTENSIONS" --build-cli --build-fpm --with-libs="$LIBRARIES")
+          if [ "$RUNNER_OS" != macOS ]; then
+            "${base[@]}"
+          else
+            # One extension that won't build shouldn't cost PHP or Xdebug.
+            "${base[@]}" --build-shared="$SHARED" || "${base[@]}" --build-shared=xdebug
+          fi
       - name: Check the build
         run: |
           php=buildroot/bin/php
           "$php" -v | grep -F "PHP $PHP_VERSION "
           for ext in intl pdo_pgsql sodium redis; do "$php" -m | grep -qx "$ext"; done
+          "$php" -r 'foreach (["imagejpeg", "imagewebp", "imagettftext"] as $f) { if (!function_exists($f)) { echo "missing $f\n"; exit(1); } }'
           buildroot/bin/php-fpm -v | grep -F "PHP $PHP_VERSION "
           # A closed port must fail at once. Swoole's driver hangs here.
           perl -e 'alarm 20; exec @ARGV' "$php" -r 'try { new PDO("pgsql:host=127.0.0.1;port=1;dbname=x"); } catch (PDOException $e) { exit(0); } exit(1);'
@@ -82,11 +99,28 @@ jobs:
         if: runner.os == 'macOS'
         run: codesign --force --sign - buildroot/bin/php buildroot/bin/php-fpm
       - name: Package
-        run: tar czf "php-$PHP_VERSION-$PLATFORM.tar.gz" -C buildroot/bin php php-fpm
+        run: |
+          mkdir out
+          tar czf "out/php-$PHP_VERSION-$PLATFORM-r$REVISION.tar.gz" -C buildroot/bin php php-fpm
+          [ "$RUNNER_OS" = macOS ] || exit 0
+          for name in ${SHARED//,/ }; do
+            so=$(find buildroot -name "$name.so" | head -1)
+            [ -n "$so" ] || { echo "$name wasn't built"; continue; }
+            directive=extension
+            [ "$name" = xdebug ] && directive=zend_extension
+            codesign --force --sign - "$so"
+            # Publish only what really loads into this PHP.
+            if buildroot/bin/php -n -d "$directive=$PWD/$so" -r "exit(extension_loaded('$name') ? 0 : 1);"; then
+              cp "$so" "out/ext-$name-$PHP_VERSION-$PLATFORM-r$REVISION.so"
+            else
+              echo "$name doesn't load"
+            fi
+          done
+          ls -la out
       - uses: actions/upload-artifact@v4
         with:
           name: php-${{ matrix.version }}-${{ matrix.platform }}
-          path: php-${{ matrix.version }}-${{ matrix.platform }}.tar.gz
+          path: out/*
           if-no-files-found: error
 
   publish:

@@ -2,8 +2,11 @@
 """Plans and publishes Corral's PHP feed. See .github/workflows/php.yml.
 
 php.json lists every build: {"builds": {"8.4.27": {"macos-aarch64":
-{"url": ..., "sha256": ...}}}}. Corral accepts it only with a valid
-php.json.sig, made with CORRAL_PHP_FEED_KEY.
+{"url": ..., "sha256": ..., "rev": 2, "extensions": {"xdebug": {...}}}}}}.
+Corral accepts it only with a valid php.json.sig, made with CORRAL_PHP_FEED_KEY.
+
+Raise REVISION to rebuild the current versions, say with another library:
+Corral then offers 8.4.27-3 over 8.4.27-2.
 
 scripts/security.json holds the oldest patch of each line without known flaws.
 Raising a line there and pushing marks older versions as vulnerable in every
@@ -24,6 +27,7 @@ REPO = os.environ.get("GITHUB_REPOSITORY", "manuelcardona0228/corral_php")
 FEED_TAG = "php-feed"
 FEED_URL = f"https://github.com/{REPO}/releases/download/{FEED_TAG}/php.json"
 LINES = ["8.5", "8.4", "8.3", "8.2"]
+REVISION = 2
 RUNNERS = {
     "macos-aarch64": "macos-15",
     "macos-x86_64": "macos-15-intel",
@@ -65,10 +69,10 @@ def plan():
     feed = current_feed()
     builds = feed["builds"]
     jobs = [
-        {"version": v, "platform": platform, "runner": runner}
+        {"version": v, "platform": platform, "runner": runner, "revision": REVISION}
         for v in wanted
         for platform, runner in RUNNERS.items()
-        if platform not in builds.get(v, {})
+        if builds.get(v, {}).get(platform, {}).get("rev", 0) < REVISION
     ]
     print(f"matrix={json.dumps(jobs)}")
     print(f"any={'true' if jobs else 'false'}")
@@ -95,22 +99,26 @@ def sign(raw):
 
 def publish(folder):
     feed = current_feed()
-    files = sorted(glob.glob(os.path.join(folder, "php-*.tar.gz")))
-    for path in files:
-        name = os.path.basename(path)
-        match = re.fullmatch(r"php-(\d+\.\d+\.\d+)-(.+)\.tar\.gz", name)
-        if not match:
-            sys.exit(f"unexpected file: {name}")
-        version, platform = match.groups()
+    def upload(path, version):
         tag = f"php-{version}"
         ensure_release(tag, f"PHP {version}", f"Corral's builds of PHP {version}.")
         gh("release", "upload", tag, path, "--clobber")
         with open(path, "rb") as f:
             digest = hashlib.sha256(f.read()).hexdigest()
-        feed["builds"].setdefault(version, {})[platform] = {
-            "url": f"https://github.com/{REPO}/releases/download/{tag}/{name}",
-            "sha256": digest,
-        }
+        return {"url": f"https://github.com/{REPO}/releases/download/{tag}/{os.path.basename(path)}", "sha256": digest}
+
+    for path in sorted(glob.glob(os.path.join(folder, "php-*.tar.gz"))):
+        match = re.fullmatch(r"php-(\d+\.\d+\.\d+)-(.+)-r(\d+)\.tar\.gz", os.path.basename(path))
+        if not match:
+            sys.exit(f"unexpected file: {path}")
+        version, platform, rev = match.groups()
+        feed["builds"].setdefault(version, {})[platform] = {**upload(path, version), "rev": int(rev), "extensions": {}}
+    for path in sorted(glob.glob(os.path.join(folder, "ext-*.so"))):
+        match = re.fullmatch(r"ext-([a-z0-9_]+)-(\d+\.\d+\.\d+)-(.+)-r\d+\.so", os.path.basename(path))
+        if not match:
+            sys.exit(f"unexpected file: {path}")
+        name, version, platform = match.groups()
+        feed["builds"][version][platform]["extensions"][name] = upload(path, version)
     feed["secure"] = security()
     raw = json.dumps(feed, indent=2, sort_keys=True).encode()
     with open("php.json", "wb") as f:
